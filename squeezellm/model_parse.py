@@ -10,8 +10,8 @@ def load_model(model, model_type, cache_dir=None):
             trust_remote_code=True,
         )
     else:
-        model = LlamaForCausalLM.from_pretrained(
-            model, torch_dtype="auto", cache_dir=cache_dir
+        model = AutoModelForCausalLM.from_pretrained(
+            model, torch_dtype="auto", cache_dir=cache_dir, trust_remote_code=True
         )
     return model
 
@@ -19,6 +19,8 @@ def load_model(model, model_type, cache_dir=None):
 def parse_model(model):
     if "opt" in str(type(model)).lower():
         model_type = "opt"
+    elif "qwen" in str(type(model)).lower():
+        model_type = "qwen"
     elif "mistral" in str(type(model)).lower():
         model_type = "mistral"
     else:
@@ -33,7 +35,7 @@ def get_module_names(model_type):
     if model_type == "opt":
         return ["q", "k", "v", "o", "up", "down"]
     else:
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         return ["q", "k", "v", "o", "gate", "up", "down"]
 
 
@@ -49,7 +51,7 @@ def get_modules(layer, model_type):
         ]
     else:
         # llama or vicuna
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         modules = [
             layer.self_attn.q_proj,
             layer.self_attn.k_proj,
@@ -74,7 +76,7 @@ def get_sequential(model_type):
             "fc2",
         ]
     else:
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         return [
             "self_attn.q_proj",
             "self_attn.k_proj",
@@ -90,7 +92,7 @@ def get_model(model, model_type):
     if model_type == "opt":
         return model.model.decoder
     else:
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         return model.model
 
 
@@ -99,7 +101,7 @@ def get_layers(model, model_type):
     if model_type == "opt":
         return _model.layers
     else:
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         return _model.layers
 
 
@@ -107,7 +109,7 @@ def get_layers_name(model_type):
     if model_type == "opt":
         return "model.decoder.layers"
     else:
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         return "model.layers"
 
 
@@ -116,7 +118,7 @@ def get_embedding(model, model_type):
     if model_type == "opt":
         return [_model.embed_tokens, _model.embed_positions]
     else:
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         return [_model.embed_tokens]
 
 
@@ -125,5 +127,5 @@ def get_norm(model, model_type):
     if model_type == "opt":
         return _model.final_layer_norm
     else:
-        assert model_type == "llama" or model_type == "mistral"
+        assert model_type in ("llama", "mistral", "qwen")
         return _model.norm

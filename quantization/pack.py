@@ -7,14 +7,25 @@ import torch
 import torch.nn as nn
 import transformers
 from squeezellm.modelutils import *
+from squeezellm.model_parse import (
+    get_layers,
+    get_layers_name,
+    get_module_names,
+    get_sequential,
+    parse_model,
+)
 from squeezellm.quant import *
 
 
 @torch.no_grad()
-def llama_sequential(model, folder, include_sparse):
+def llama_sequential(model, folder, include_sparse, model_type=None):
     print("Starting ...")
 
-    layers = model.model.layers
+    model_type = model_type or parse_model(model)
+    layers = get_layers(model, model_type)
+    sequential_lut = get_module_names(model_type)
+    sequential_lut_real_name = dict(zip(sequential_lut, get_sequential(model_type)))
+    layers_name = get_layers_name(model_type)
 
     quantizers = {}
     for i in range(len(layers)):
@@ -31,18 +42,7 @@ def llama_sequential(model, folder, include_sparse):
                 # and each of them are a tuple (centroids, indices)
                 outlier_list_layer = pickle.load(f)
 
-        sequential_lut = ["q", "k", "v", "o", "gate", "up", "down"]
-        sequential_lut_real_name = {
-            "q": "self_attn.q_proj",
-            "k": "self_attn.k_proj",
-            "v": "self_attn.v_proj",
-            "o": "self_attn.o_proj",
-            "gate": "mlp.gate_proj",
-            "up": "mlp.up_proj",
-            "down": "mlp.down_proj",
-        }
-
-        outlier_index = {"q": 0, "k": 1, "v": 2, "o": 3, "gate": 4, "up": 5, "down": 6}
+        outlier_index = {name: idx for idx, name in enumerate(sequential_lut)}
 
         for s in sequential_lut:
             lut = lut_layer[s]
@@ -52,7 +52,7 @@ def llama_sequential(model, folder, include_sparse):
             else:
                 outliers = None
             name = sequential_lut_real_name[s]
-            quantizers["model.layers.%d.%s" % (i, name)] = [lut, outliers]
+            quantizers[f"{layers_name}.{i}.{name}"] = [lut, outliers]
 
     return quantizers
 
@@ -105,6 +105,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--model", type=str, help="llama model to load")
     parser.add_argument(
+        "--model_type",
+        type=str,
+        default=None,
+        choices=["llama", "mistral", "opt", "qwen"],
+        help="Model family. Defaults to auto-detect.",
+    )
+    parser.add_argument(
         "--wbits",
         type=int,
         default=16,
@@ -155,6 +162,7 @@ if __name__ == "__main__":
         model=model,
         folder=args.folder,
         include_sparse=args.include_sparse,
+        model_type=args.model_type,
     )
     print("llama_sequential Done:", time.time() - tick)
 

@@ -21,7 +21,7 @@ parser.add_argument(
     type=str,
     default=None,
     help="model type",
-    choices=["llama", "opt", "mistral"],
+    choices=["llama", "opt", "mistral", "qwen"],
 )
 
 args = parser.parse_args()

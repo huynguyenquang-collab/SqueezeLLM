@@ -17,7 +17,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--model", type=str, help="model weights to load", required=True)
 parser.add_argument(
-    "--model_type", type=str, default=None, help="model type", choices=["llama", "opt"]
+    "--model_type", type=str, default=None, help="model type", choices=["llama", "opt", "mistral", "qwen"]
 )
 parser.add_argument(
     "--gradient", type=str, help="model gradients to load", required=True
@@ -55,7 +55,7 @@ def kmeans_fit(row_data):
         n_init="auto",
         max_iter=50,
     ).fit(weights_np, sample_weight=sample_weight)
-    return kmeans.cluster_centers_.reshape(-1), np.cast["byte"](kmeans.labels_)
+    return kmeans.cluster_centers_.reshape(-1), np.asarray(kmeans.labels_, dtype=np.uint8)
 
 
 if __name__ == "__main__":
@@ -203,4 +203,3 @@ if __name__ == "__main__":
     
     pool.close()
     pool.join()
-

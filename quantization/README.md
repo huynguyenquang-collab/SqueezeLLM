@@ -87,3 +87,147 @@ In this case, you will need to  proceed with D+S packing using the following com
 python pack.py --model [MODEL_PATH] --wbits 4 --folder [LUT_PATH] --save [PACKED_CKPT_PATH] --include_sparse --balance
 ```
 This command incorporates two additional arguments, `--include_sparse` and `--balance`.
+
+## Plain LNQ, Without GuidedQuant
+
+This repository also includes a small plain-LNQ adapter in `quantization/lnq.py`.
+It follows the LNQ objective described in `document.md`: optimize a
+non-uniform scalar LUT against the layer-wise output error
+`||XW - XW_hat||`, using the ordinary activation Hessian `X^T X`.
+
+Important: plain LNQ is initialized from SqueezeLLM assignments/codebooks, as in
+the GuidedQuant experiments. LNQ then refines that feasible SqueezeLLM solution
+with alternating closed-form codebook updates and coordinate-descent assignment
+updates. It is not GuidedQuant: the Hessian is ordinary `X^T X`, not the
+saliency-weighted/end-loss-guided Hessian. The output is still the standard
+SqueezeLLM LUT format, so the existing `pack.py` and CUDA inference path can
+stay unchanged.
+
+### Plain LNQ steps
+
+1. Chunk model weights:
+```
+python quantization/chunk_models.py \
+  --model [MODEL_PATH] \
+  --model_type llama \
+  --output_path [MODEL_CHUNKS_PATH]
+```
+
+2. Accumulate ordinary LNQ Hessians:
+```
+python quantization/lnq.py hessians \
+  --model [MODEL_PATH] \
+  --dataset redpajama \
+  --nsamples 1024 \
+  --seqlen 4096 \
+  --output_folder [HESSIAN_PATH] \
+  --device cuda:0 \
+  --calib_batch_size 1 \
+  --activation_storage disk \
+  --activation_dtype float16 \
+  --hessian_save_dtype float16
+```
+
+3. Optimize LNQ LUTs:
+```
+python quantization/lnq.py quantize \
+  --model_chunks [MODEL_CHUNKS_PATH] \
+  --hessians [HESSIAN_PATH] \
+  --initial_lut [SQUEEZELLM_LUT_PATH] \
+  --output_folder [LUT_PATH] \
+  --model_type llama \
+  --bit 3 \
+  --num_iterations 3 \
+  --cd_cycles 4 \
+  --row_block 64 \
+  --device cuda:0
+```
+
+4. Pack and evaluate with the existing SqueezeLLM checkpoint format:
+```
+python quantization/pack.py \
+  --model [MODEL_PATH] \
+  --wbits 3 \
+  --folder [LUT_PATH] \
+  --save [PACKED_CKPT_PATH]
+
+python quantization/eval_nonuquantfix_ppl.py \
+  --model [MODEL_PATH] \
+  --checkpoint [PACKED_CKPT_PATH] \
+  --wbits 3 \
+  --device cuda:0
+```
+
+For A100 40GB runs, keep the paper calibration setting
+`--dataset redpajama --nsamples 1024 --seqlen 4096`. Use
+`--calib_batch_size 1`, `--row_block 32` or `--row_block 64`, and keep
+`--activation_storage disk` to avoid holding the full 1024x4096 hidden-state
+cache in host RAM. The disk activation cache is temporary and is removed after
+each Hessian pass unless `--keep_activation_cache` is set. The convenience
+script defaults to the paper calibration setting and can split Hessian/LNQ work
+across two A100s.
+
+For minimum disk usage, keep `HESSIAN_SAVE_DTYPE=float16` in the script
+environment. For maximum numerical fidelity, use `HESSIAN_SAVE_DTYPE=float32`;
+the sample count and sequence length remain the paper values in both cases.
+
+The convenience script below runs Llama-2-7B and Llama-3-8B, then evaluates
+perplexity with a NonUQuantFix-style sliding window:
+```
+bash bash/run_lnq_plain_llama_ppl.sh
+```
+
+Single A100:
+```
+DEVICE=cuda:0 bash bash/run_lnq_plain_llama_ppl.sh
+```
+
+Two A100s:
+```
+GPU_DEVICES="0 1" bash bash/run_lnq_plain_llama_ppl.sh
+```
+
+Because LNQ needs SqueezeLLM initialization, provide one of these:
+```
+INIT_LUT_SPECS="llama2_7b=/path/to/llama2_sqllm_init;llama3_8b=/path/to/llama3_sqllm_init" \
+bash bash/run_lnq_plain_llama_ppl.sh
+```
+or provide gradient chunks/checkpoints so the script can run `nuq.py` first:
+```
+GRADIENT_CHUNKS_SPECS="llama2_7b=/path/to/llama2_grad_chunks;llama3_8b=/path/to/llama3_grad_chunks" \
+bash bash/run_lnq_plain_llama_ppl.sh
+```
+
+### Qwen2.5-7B 3-bit LNQ/RBVT-Squeeze Job
+
+The Qwen job runs the full dense-only chain:
+SqueezeLLM weighted k-means init LUT -> LNQ plain initialized from SqueezeLLM ->
+RBVT-Squeeze initialized from LNQ -> NonUQuantFix-style PPL for LNQ and
+RBVT-Squeeze. It does not pack/evaluate a separate SqueezeLLM baseline.
+
+```
+bash bash/run_qwen25_7b_3bit_sqllm_lnq_rbvt_ppl.sh
+```
+
+Defaults:
+```
+MODEL=Qwen/Qwen2.5-7B
+BIT=3
+DATASET=redpajama
+REDPAJAMA_DATASET=ZengXiangyu/RedPajama-Data-1T-Sample
+GPU_DEVICES="0 1"
+NSAMPLES=1024
+SEQLEN=4096
+```
+
+For A100 40GB keep batch sizes at 1:
+```
+FISHER_BATCH_SIZE=1 CALIB_BATCH_SIZE=1 RBVT_BATCH_SIZE=1 \
+bash bash/run_qwen25_7b_3bit_sqllm_lnq_rbvt_ppl.sh
+```
+
+The job uses both GPUs whenever the stage can be split by layer:
+Fisher collection for SqueezeLLM init, LNQ Hessian collection, LNQ
+assignment/codebook optimization, and RBVT-Squeeze assignment correction are
+sharded across `GPU_DEVICES`. Packing and PPL evaluation remain single-process
+and use `DEVICE` (default `cuda:0`).
