@@ -6,14 +6,16 @@ import random
 import warnings
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers.tokenization_utils_base import BatchEncoding
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llama import load_quant
+from squeezellm.model_parse import get_layers, get_module_names, get_modules
 
 
 def load_tokenizer(model, token=None):
@@ -86,7 +88,7 @@ def load_guidedquant_input_tokens(dataset_name, tokenizer, chunk_size, cache_dir
 
     if dataset_name == "wikitext2":
         dataset = load_dataset(
-            "wikitext",
+            "Salesforce/wikitext",
             "wikitext-2-raw-v1",
             split="test",
             token=token,
@@ -138,6 +140,57 @@ def register_linear_input_cast_hooks(module):
         if isinstance(submodule, nn.Linear):
             handles.append(submodule.register_forward_pre_hook(hook))
     return handles
+
+
+def lut_row_to_weight(row_lut):
+    chunks = []
+    for centers, labels in row_lut:
+        centers = np.asarray(centers).reshape(-1)
+        labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+        chunks.append(torch.from_numpy(centers[labels]))
+    return torch.cat(chunks, dim=0)
+
+
+def lut_module_to_weight(module_lut, dtype):
+    rows = [lut_row_to_weight(row_lut) for row_lut in module_lut]
+    return torch.stack(rows, dim=0).to(dtype=dtype)
+
+
+@torch.inference_mode()
+def apply_lut_folder_to_dense_model(model, lut_folder, model_type, dtype):
+    layers = get_layers(model, model_type)
+    module_names = get_module_names(model_type)
+    for layer_idx, layer in enumerate(tqdm(layers, desc="Applying dense LUT weights")):
+        lut_file = Path(lut_folder) / "lut" / f"l{layer_idx}.pkl"
+        if not lut_file.exists():
+            raise FileNotFoundError(f"Missing LUT file: {lut_file}")
+        with open(lut_file, "rb") as handle:
+            layer_lut = pickle.load(handle)
+        modules = get_modules(layer, model_type)
+        for short_name, module in zip(module_names, modules):
+            weight = lut_module_to_weight(layer_lut[short_name], dtype)
+            if tuple(weight.shape) != tuple(module.weight.shape):
+                raise ValueError(
+                    f"{lut_file}:{short_name} produced shape {tuple(weight.shape)}, "
+                    f"expected {tuple(module.weight.shape)}"
+                )
+            module.weight.copy_(weight.to(device=module.weight.device))
+        del layer_lut
+        gc.collect()
+
+
+def load_dense_lut_model(model_name, lut_folder, model_type, device, dtype, token=None):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            token=token,
+        )
+    model.config.use_cache = False
+    apply_lut_folder_to_dense_model(model, lut_folder, model_type, dtype)
+    return model.eval().to(device)
 
 
 @torch.inference_mode()
@@ -192,6 +245,23 @@ def evaluate(model, tokenizer, texts, device, max_length, stride, batch_size, li
         if seq_len < 2:
             continue
 
+        if batch_size <= 1:
+            prev_end = 0
+            for begin in tqdm(range(0, seq_len, stride), desc=f"Windows ({seq_len:,} toks)", leave=False):
+                end = min(begin + max_length, seq_len)
+                trg_len = end - prev_end
+                chunk = input_ids[:, begin:end]
+                target = chunk.clone()
+                if begin > 0:
+                    target[:, :-trg_len] = -100
+                out = model(chunk, labels=target)
+                nlls.append(out.loss.float() * trg_len)
+                prev_end = end
+                if end == seq_len:
+                    break
+            total_tokens += seq_len
+            continue
+
         windows = []
         prev_end = 0
         for begin in range(0, seq_len, stride):
@@ -244,13 +314,17 @@ def main():
     parser.add_argument("--model", required=True, help="Base HF model/tokenizer.")
     parser.add_argument("--checkpoint", required=True, help="Packed SqueezeLLM checkpoint.")
     parser.add_argument("--wbits", type=int, required=True, choices=[3, 4])
+    parser.add_argument("--model_type", default="qwen", choices=["llama", "mistral", "opt", "qwen"])
+    parser.add_argument("--backend", default="quant_cuda", choices=["quant_cuda", "dense_lut"])
+    parser.add_argument("--lut_folder", default="", help="LNQ/RBVT/SqueezeLLM folder containing lut/l*.pkl.")
+    parser.add_argument("--dense_dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--datasets", nargs="+", default=["wikitext2", "c4"], choices=["wikitext2", "c4"])
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--include_sparse", action="store_true")
     parser.add_argument("--num_dense_channels", type=int, default=10)
     parser.add_argument("--stride", type=int, default=512)
     parser.add_argument("--max_length", type=int, default=2048)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--c4_samples", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache_dir", default="cache/nonuquantfix_ppl")
@@ -264,13 +338,30 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = load_tokenizer(args.model, args.hf_token)
-    model = load_quant(
-        args.model,
-        args.checkpoint,
-        args.wbits,
-        args.include_sparse,
-        args.num_dense_channels,
-    ).to(args.device)
+    if args.backend == "dense_lut":
+        if not args.lut_folder:
+            raise ValueError("--backend dense_lut requires --lut_folder")
+        dense_dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }[args.dense_dtype]
+        model = load_dense_lut_model(
+            args.model,
+            args.lut_folder,
+            args.model_type,
+            args.device,
+            dense_dtype,
+            args.hf_token,
+        )
+    else:
+        model = load_quant(
+            args.model,
+            args.checkpoint,
+            args.wbits,
+            args.include_sparse,
+            args.num_dense_channels,
+        ).to(args.device)
 
     results = {}
     dtype_hooks = register_linear_input_cast_hooks(model)
@@ -324,6 +415,8 @@ def main():
         "max_length": args.max_length,
         "batch_size": args.batch_size,
         "eval_style": args.eval_style,
+        "backend": args.backend,
+        "lut_folder": args.lut_folder,
         "results": results,
     }
     if args.output_file:
