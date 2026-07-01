@@ -82,6 +82,7 @@ PACK_DIR="${OUTPUT_ROOT}/packed"
 PPL_DIR="${OUTPUT_ROOT}/ppl"
 mkdir -p "${PACK_DIR}" "${PPL_DIR}"
 
+SQ_CKPT="${PACK_DIR}/${MODEL_LABEL}_squeezellm_w${BIT}.pt"
 LNQ_CKPT="${PACK_DIR}/${MODEL_LABEL}_lnq_plain_w${BIT}.pt"
 RBVT_CKPT="${PACK_DIR}/${MODEL_LABEL}_rbvt_squeeze_w${BIT}.pt"
 RBVT_STATS="${OUTPUT_ROOT}/rbvt_stats_${DATASET}_s${NSAMPLES}_blk${SEQLEN}_n${RBVT_N_CALIB}.pt"
@@ -494,6 +495,19 @@ else
     --bit "${BIT}" \
     --output_folder "${SQ_DIR}"
 fi
+
+if [[ -s "${SQ_CKPT}" && "${FORCE_REPACK}" != "1" ]]; then
+  log "Reusing packed SqueezeLLM checkpoint at ${SQ_CKPT}"
+else
+  log "Packing SqueezeLLM"
+  "${PYTHON_BIN}" quantization/pack.py \
+    --model "${MODEL}" \
+    --model_type "${MODEL_TYPE}" \
+    --wbits "${BIT}" \
+    --folder "${SQ_DIR}" \
+    --save "${SQ_CKPT}"
+fi
+run_ppl "squeezellm" "${SQ_CKPT}"
 
 if stage_complete "${HESSIAN_DIR}" 'l*.pt' "${LAYER_COUNT}"; then
   log "LNQ Hessians complete in ${HESSIAN_DIR}; skipping"
